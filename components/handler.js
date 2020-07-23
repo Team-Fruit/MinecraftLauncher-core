@@ -1,11 +1,17 @@
 const fs = require('fs')
+const fsPromises = fs.promises
 const shelljs = require('shelljs')
 const path = require('path')
 const request = require('request')
 const checksum = require('checksum')
 const Zip = require('adm-zip')
 const child = require('child_process')
+const util = require('util')
 let counter = 0
+
+const exists = file => fsPromises.access(file, fs.constants.F_OK)
+  .then(() => true)
+  .catch(() => false)
 
 class Handler {
   constructor (client) {
@@ -84,7 +90,7 @@ class Handler {
       file.on('error', async (e) => {
         this.client.emit('debug', `[MCLC]: Failed to download asset to ${path.join(directory, name)} due to\n${e}.` +
                     ` Retrying... ${retry}`)
-        if (fs.existsSync(path.join(directory, name))) shelljs.rm(path.join(directory, name))
+        if (await exists(path.join(directory, name))) shelljs.rm(path.join(directory, name))
         if (retry) await this.downloadAsync(url, directory, name, false, type)
         resolve()
       })
@@ -105,12 +111,14 @@ class Handler {
   }
 
   getVersion () {
-    return new Promise(resolve => {
+    return new Promise(async resolve => {
       const versionJsonPath = this.options.overrides.versionJson || path.join(this.options.directory, `${this.options.version.number}.json`)
-      if (fs.existsSync(versionJsonPath)) {
-        this.version = JSON.parse(fs.readFileSync(versionJsonPath))
-        return resolve(this.version)
-      }
+      await fsPromises.readFile(versionJsonPath)
+        .then(file => {
+          this.version = JSON.parse(file)
+          return resolve(this.version)
+        })
+        .catch()
 
       const manifest = `${this.options.overrides.url.meta}/mc/game/version_manifest.json`
       request.get(manifest, (error, response, body) => {
@@ -136,19 +144,19 @@ class Handler {
   async getJar () {
     await this.downloadAsync(this.version.downloads.client.url, this.options.directory, `${this.options.version.number}.jar`, true, 'version-jar')
 
-    fs.writeFileSync(path.join(this.options.directory, `${this.options.version.number}.json`), JSON.stringify(this.version, null, 4))
+    await fsPromises.writeFile(path.join(this.options.directory, `${this.options.version.number}.json`), JSON.stringify(this.version, null, 4))
 
     return this.client.emit('debug', '[MCLC]: Downloaded version jar and wrote version json')
   }
 
   async getAssets () {
     const assetDirectory = path.resolve(this.options.overrides.assetRoot || path.join(this.options.root, 'assets'))
-    if (!fs.existsSync(path.join(assetDirectory, 'indexes', `${this.version.assetIndex.id}.json`))) {
+    if (!await exists(path.join(assetDirectory, 'indexes', `${this.version.assetIndex.id}.json`))) {
       await this.downloadAsync(this.version.assetIndex.url, path.join(assetDirectory, 'indexes'),
                   `${this.version.assetIndex.id}.json`, true, 'asset-json')
     }
 
-    const index = JSON.parse(fs.readFileSync(path.join(assetDirectory, 'indexes', `${this.version.assetIndex.id}.json`), { encoding: 'utf8' }))
+    const index = JSON.parse(await fsPromises.readFile(path.join(assetDirectory, 'indexes', `${this.version.assetIndex.id}.json`), { encoding: 'utf8' }))
 
     this.client.emit('progress', {
       type: 'assets',
@@ -161,7 +169,7 @@ class Handler {
       const subhash = hash.substring(0, 2)
       const subAsset = path.join(assetDirectory, 'objects', subhash)
 
-      if (!fs.existsSync(path.join(subAsset, hash)) || !await this.checkSum(hash, path.join(subAsset, hash))) {
+      if (!await exists(path.join(subAsset, hash)) || !await this.checkSum(hash, path.join(subAsset, hash))) {
         await this.downloadAsync(`${this.options.overrides.url.resource}/${subhash}/${hash}`, subAsset, hash,
           true, 'assets')
         counter++
@@ -192,12 +200,12 @@ class Handler {
         const legacyAsset = asset.split('/')
         legacyAsset.pop()
 
-        if (!fs.existsSync(path.join(assetDirectory, 'legacy', legacyAsset.join('/')))) {
+        if (!await exists(path.join(assetDirectory, 'legacy', legacyAsset.join('/')))) {
           shelljs.mkdir('-p', path.join(assetDirectory, 'legacy', legacyAsset.join('/')))
         }
 
-        if (!fs.existsSync(path.join(assetDirectory, 'legacy', asset))) {
-          fs.copyFileSync(path.join(subAsset, hash), path.join(assetDirectory, 'legacy', asset))
+        if (!await exists(path.join(assetDirectory, 'legacy', asset))) {
+          await fsPromises.copyFile(path.join(subAsset, hash), path.join(assetDirectory, 'legacy', asset))
         }
         counter++
         this.client.emit('progress', {
@@ -233,7 +241,7 @@ class Handler {
   async getNatives () {
     const nativeDirectory = path.resolve(this.options.overrides.natives || path.join(this.options.root, 'natives', this.version.id))
 
-    if (!fs.existsSync(nativeDirectory) || !fs.readdirSync(nativeDirectory).length) {
+    if (!await exists(nativeDirectory) || !await fsPromises.readdir(nativeDirectory).length) {
       shelljs.mkdir('-p', nativeDirectory)
 
       const natives = async () => {
@@ -266,7 +274,9 @@ class Handler {
           await this.downloadAsync(native.url, nativeDirectory, name, true, 'natives')
         }
         try {
-          new Zip(path.join(nativeDirectory, name)).extractAllTo(nativeDirectory, true)
+          const zip = new Zip(path.join(nativeDirectory, name))
+          const extractAllToAsync = util.promisify(zip.extractAllToAsync).bind(zip);
+          await extractAllToAsync(nativeDirectory, true)
         } catch (e) {
           // Only doing a console.warn since a stupid error happens. You can basically ignore this.
           // if it says Invalid file name, just means two files were downloaded and both were deleted.
@@ -292,7 +302,7 @@ class Handler {
 
   // Not bothering to rewrite this.
   async getForgeDependenciesLegacy () {
-    if (!fs.existsSync(path.join(this.options.root, 'forge'))) {
+    if (!await exists(path.join(this.options.root, 'forge'))) {
       shelljs.mkdir('-p', path.join(this.options.root, 'forge'))
     }
 
@@ -310,7 +320,7 @@ class Handler {
       return null
     }
 
-    const forge = JSON.parse(fs.readFileSync(path.join(this.options.root, 'forge', `${this.version.id}`, 'version.json'), { encoding: 'utf8' }))
+    const forge = JSON.parse(await fsPromises.readFile(path.join(this.options.root, 'forge', `${this.version.id}`, 'version.json'), { encoding: 'utf8' }))
     const paths = []
 
     this.client.emit('progress', {
@@ -340,13 +350,13 @@ class Handler {
 
       const downloadLink = `${url}${lib[0].replace(/\./g, '/')}/${lib[1]}/${lib[2]}/${name}`
 
-      if (fs.existsSync(path.join(jarPath, name))) {
+      if (await exists(path.join(jarPath, name))) {
         paths.push(`${jarPath}${path.sep}${name}`)
         counter++
         this.client.emit('progress', { type: 'forge', task: counter, total: forge.libraries.length })
         return
       }
-      if (!fs.existsSync(jarPath)) shelljs.mkdir('-p', jarPath)
+      if (!await exists(jarPath)) shelljs.mkdir('-p', jarPath)
 
       const download = await this.downloadAsync(downloadLink, jarPath, name, true, 'forge')
       if (!download) await this.downloadAsync(`${this.options.overrides.url.fallbackMaven}${lib[0].replace(/\./g, '/')}/${lib[1]}/${lib[2]}/${name}`, jarPath, name, true, 'forge')
@@ -367,24 +377,23 @@ class Handler {
   }
 
   getForgedWrapped () {
-    return new Promise(resolve => {
+    return async resolve => {
       const libraryDirectory = path.resolve(this.options.overrides.libraryRoot || path.join(this.options.root, 'libraries'))
       const launchArgs = `"${this.options.javaPath ? this.options.javaPath : 'java'}" -jar ${path.resolve(this.options.forgeWrapper.jar)}` +
       ` --installer=${this.options.forge} --instance=${this.options.root} ` +
       `--saveTo=${path.join(libraryDirectory, 'io', 'github', 'zekerzhayard', 'ForgeWrapper', this.options.forgeWrapper.version)}`
 
-      const fw = child.exec(launchArgs)
+      const exec = util.promisify(child.exec)
+      const fw = await exec(launchArgs)
       const forgeJson = path.join(this.options.root, 'forge', this.version.id, 'version.json')
 
-      fw.on('close', (e) => {
-        if (!fs.existsSync(forgeJson)) {
+      await fsPromises.readFile(forgeJson, { encoding: 'utf8' })
+        .then(file => JSON.parse(file))
+        .catch(() => {
           this.client.emit('debug', '[MCLC]: ForgeWrapper did not produce a version file, using Vanilla')
-          resolve(null)
-        } else {
-          resolve(JSON.parse(fs.readFileSync(forgeJson, { encoding: 'utf8' })))
-        }
-      })
-    })
+          return null
+        })
+    }
   }
 
   runInstaller (path) {
@@ -411,7 +420,7 @@ class Handler {
         jarPath = path.join(directory, `${lib[0].replace(/\./g, '/')}/${lib[1]}/${lib[2]}`)
       }
 
-      if (!fs.existsSync(path.join(jarPath, name))) {
+      if (!await exists(path.join(jarPath, name))) {
         // Simple lib support, forgot which addon needed this but here you go, Mr special.
         if (library.url) {
           const url = `${library.url}${lib[0].replace(/\./g, '/')}/${lib[1]}/${lib[2]}/${name}`

@@ -2,7 +2,12 @@ const child = require('child_process')
 const path = require('path')
 const Handler = require('./handler')
 const fs = require('fs')
+const fsPromises = fs.promises
 const EventEmitter = require('events').EventEmitter
+
+const exists = file => fsPromises.access(file, fs.constants.F_OK)
+  .then(() => true)
+  .catch(() => false)
 
 class MCLCore extends EventEmitter {
   async launch (options) {
@@ -30,9 +35,9 @@ class MCLCore extends EventEmitter {
 
     this.handler = new Handler(this)
 
-    if (fs.existsSync(path.join(__dirname, '..', 'package.json'))) {
-      this.emit('debug', `[MCLC]: MCLC version ${JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), { encoding: 'utf8' })).version}`)
-    } else { this.emit('debug', '[MCLC]: Package JSON not found, skipping MCLC version check.') }
+    await fsPromises.readFile(path.join(__dirname, '..', 'package.json'), { encoding: 'utf8' })
+      .then(file => this.emit('debug', `[MCLC]: MCLC version ${JSON.parse(file).version}`))
+      .catch(() => this.emit('debug', '[MCLC]: Package JSON not found, skipping MCLC version check.'))
     const java = await this.handler.checkJava(this.options.javaPath || 'java')
     if (!java.run) {
       this.emit('debug', `[MCLC]: Couldn't start Minecraft due to: ${java.message}`)
@@ -40,10 +45,9 @@ class MCLCore extends EventEmitter {
       return null
     }
 
-    if (!fs.existsSync(this.options.root)) {
-      this.emit('debug', '[MCLC]: Attempting to create root folder')
-      fs.mkdirSync(this.options.root)
-    }
+    await fsPromises.mkdir(this.options.root)
+      .then(() => this.emit('debug', '[MCLC]: Attempting to create root folder'))
+      .catch(() => false)
 
     if (this.options.clientPackage) {
       this.emit('debug', `[MCLC]: Extracting client package to ${this.options.root}`)
@@ -53,7 +57,7 @@ class MCLCore extends EventEmitter {
     if (this.options.installer) {
       // So the forge installer can run without breaking :)
       const profilePath = path.join(this.options.root, 'launcher_profiles.json')
-      if (!fs.existsSync(profilePath)) { fs.writeFileSync(profilePath, JSON.stringify({}, null, 4)) }
+      if (!await exists(profilePath)) { fsPromises.writeFileSync(profilePath, JSON.stringify({}, null, 4)) }
       await this.handler.runInstaller(this.options.installer)
     }
 
@@ -66,7 +70,7 @@ class MCLCore extends EventEmitter {
       : path.join(directory, `${this.options.version.number}.jar`))
     const nativePath = await this.handler.getNatives()
 
-    if (!fs.existsSync(mcPath)) {
+    if (!await exists(mcPath)) {
       this.emit('debug', '[MCLC]: Attempting to download Minecraft version jar')
       await this.handler.getJar()
     }
@@ -81,7 +85,7 @@ class MCLCore extends EventEmitter {
     }
     if (this.options.version.custom || custom) {
       if (!custom) this.emit('debug', '[MCLC]: Detected custom in options, setting custom version file')
-      custom = custom || JSON.parse(fs.readFileSync(path.join(this.options.root, 'versions', this.options.version.custom, `${this.options.version.custom}.json`), { encoding: 'utf8' }))
+      custom = custom || JSON.parse(await fsPromises.readFile(path.join(this.options.root, 'versions', this.options.version.custom, `${this.options.version.custom}.json`), { encoding: 'utf8' }))
     }
 
     const args = []
@@ -112,7 +116,7 @@ class MCLCore extends EventEmitter {
     } else {
       const file = custom || versionFile
       // So mods like fabric work.
-      const jar = fs.existsSync(mcPath)
+      const jar = (await exists(mcPath))
         ? `${separator}${mcPath}`
         : `${separator}${path.join(directory, `${this.options.version.number}.jar`)}`
       classPaths.push(`${classes.join(separator)}${jar}`)
